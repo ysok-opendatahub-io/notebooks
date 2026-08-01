@@ -1,182 +1,106 @@
 # Building Hermetic Notebook Images for Open Data Hub and OpenShift AI
 
-*How we made workbench and runtime image builds offline, reproducible, and release-policy ready — and what other teams can reuse.*
+*How we made workbench and runtime image builds offline, reproducible, and release-ready, and what other teams can reuse.*
 
-> **Draft** for Red Hat Developer / internal sharing. Based on [opendatahub-io/notebooks](https://github.com/opendatahub-io/notebooks) (`development`) and the downstream [red-hat-data-services/notebooks](https://github.com/red-hat-data-services/notebooks) fork.
-
----
-
-## Abstract
-
-Open Data Hub and Red Hat OpenShift AI notebook images now build hermetically: dependencies are lockfile-pinned and prefetched before a network-isolated container build. The same Dockerfiles work locally, in GitHub Actions, and on Konflux, while satisfying Conforma-style release checks.
+> Based on work in [opendatahub-io/notebooks](https://github.com/opendatahub-io/notebooks) and the downstream [red-hat-data-services/notebooks](https://github.com/red-hat-data-services/notebooks) fork.
 
 ---
 
-## Why hermetic builds matter
+If you have ever watched a container build fail because a package mirror hiccuped, or wondered whether last month’s image really matches what you ship today, you already know the pain hermetic builds are meant to solve.
 
-A hermetic container build runs **with no network access**. Every RPM, npm package, Python wheel, and Go module is downloaded and checksum-pinned *before* `podman` or `buildah` starts. The Dockerfile then installs only from that local cache ([Cachi2](https://github.com/containerbuildsystem/cachi2) / [Hermeto](https://github.com/hermetoproject/hermeto)).
+For Open Data Hub (ODH) and Red Hat OpenShift AI notebook images, we moved to a simple rule: **nothing downloads during the image build**. Dependencies are pinned in lockfiles, prefetched ahead of time, and installed from a local cache while the build runs with no network. The same Dockerfiles work on a laptop, in GitHub Actions, and on Konflux.
 
-That matters for three reasons:
-
-1. **Reproducibility** — identical lockfiles produce identical dependency trees, regardless of mirror drift or floating tags.
-2. **Auditability** — packages are pinned by URL and SHA-256. SBOMs can classify them by ecosystem (`rpm`, `pip`, `npm`, `gomod`) instead of opaque tarball URLs.
-3. **Compliance** — Konflux product builds for OpenShift AI require network isolation (`hermetic: true`) and [Conforma](https://conforma.dev/) checks (hermetic task, SBOM, RPM signatures, required labels). Upstream Open Data Hub images use the same hermetic pipeline; Conforma enforcement applies on the product path (`quay.io/rhoai/`).
-
-In-tree guides worth bookmarking:
-
-- [hermetic-guide.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/hermetic-guide.md)
-- [lockfile-generators README](https://github.com/opendatahub-io/notebooks/blob/development/scripts/lockfile-generators/README.md)
-- [conforma.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/conforma.md)
+This post is the story of that shift: why it mattered, what surprised us, and where to look if you want to reuse the pattern.
 
 ---
 
-## One Dockerfile, three environments
+## Why “no network during build” matters
 
-```
-Committed lockfiles                 Prefetch                          Build (offline)
-───────────────────                 ────────                          ───────────────
-rpms.lock.yaml / artifacts.lock  →  Konflux: prefetch-dependencies →  Dockerfile.konflux.*
-requirements.<flavor>.txt           Local/GHA: prefetch-all.sh          dnf / npm ci --offline
-package-lock.json / go.mod             → cachi2/output/deps/...          uv --no-index
-```
+A hermetic container build is offline on purpose. Tools like [Cachi2](https://github.com/containerbuildsystem/cachi2) and [Hermeto](https://github.com/hermetoproject/hermeto) download every RPM, Python wheel, npm package, and Go module *before* `podman` or `buildah` starts. The Dockerfile only installs from that cache.
 
-| Environment | Prefetch | Notes |
-|---|---|---|
-| Local | `scripts/lockfile-generators/prefetch-all.sh` | Makefile mounts `cachi2/output` and Hermeto RPM repos |
-| GitHub Actions | Same script in `build-notebooks-TEMPLATE.yaml` | `--rhds` when building subscribed RHEL / AIPCC bases |
-| Konflux | Tekton `prefetch-dependencies` | `hermetic: "true"` plus typed `prefetch-input` in `.tekton/*.yaml` |
+That buys you three things:
 
-Upstream (ODH) and downstream (RHDS / AIPCC) keep **separate** lock trees under `prefetch-input/odh/` and `prefetch-input/rhds/`:
+1. **Reproducibility:** the same lockfiles produce the same dependency tree, even when mirrors drift or floating tags move.
+2. **Auditability:** packages are pinned by URL and checksum. SBOMs can name real ecosystems (`rpm`, `pip`, `npm`, `gomod`) instead of opaque tarball URLs.
+3. **Compliance:** OpenShift AI product builds on Konflux require network isolation and [Conforma](https://conforma.dev/) checks. Upstream ODH images use the same hermetic pipeline; the stricter policy applies on the product path.
 
-| | ODH | RHDS / AIPCC |
-|---|---|---|
-| Base images | CentOS Stream / ODH bases | `quay.io/aipcc/base-images/...` |
-| Prefetch | `prefetch-input/odh/` | `prefetch-input/rhds/` |
-| Subscription | None | Required (RHEL CDN) |
-| Conforma | Not applied | Applied on `quay.io/rhoai/` |
+In short: hermetic is less a CI checkbox and more a packaging discipline: pin, prefetch, install offline.
 
-Mixing variants fails at install time — for example CentOS versus RHEL FIPS provider package names. See [subscribed-builds.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/subscribed-builds.md).
-
-Jupyter and runtime images share a repo-root `prefetch-input/`. Codeserver keeps its own tree under `codeserver/ubi9-python-3.12/prefetch-input/` because its dependency set (especially npm) is different.
+For the full architecture diagram and environment matrix, see the in-repo [hermetic guide](https://github.com/opendatahub-io/notebooks/blob/main/docs/hermetic-guide.md).
 
 ---
 
-## Step 1: Generate lockfiles
+## One Dockerfile, three places to build
 
-### RPM lockfiles
+The mental model is small:
 
-Declare packages in `rpms.in.yaml`, resolve them with `rpm-lockfile-prototype` via [`create-rpm-lockfile.sh`](https://github.com/opendatahub-io/notebooks/blob/development/scripts/lockfile-generators/create-rpm-lockfile.sh), and commit `rpms.lock.yaml`.
+**Commit lockfiles → prefetch into a cache → build with the network off.**
 
-Codeserver enables `moduleEnable: [nodejs:22]` so Hermeto includes module metadata for hermetic `dnf module enable`. Release kickoff regenerates ODH and RHDS locks for both the shared root tree and codeserver (`make kickoff-release`).
+Locally and in GitHub Actions we run a shared prefetch script. On Konflux, a Tekton task does the same job. The Dockerfile does not care which environment filled the cache; it only installs from it.
 
-### Python requirements
+Upstream (ODH) and downstream (RHDS / AIPCC) keep **separate** lock trees. Mixing them fails in subtle ways, for example CentOS versus RHEL FIPS package names. If you work with subscribed RHEL bases, start with [subscribed builds](https://github.com/opendatahub-io/notebooks/blob/main/docs/subscribed-builds.md).
 
-```
-pyproject.toml → pylock.<flavor>.toml → requirements.<flavor>.txt (hashed)
-```
-
-Flavors (`cpu` / `cuda` / `rocm`) match Dockerfile suffixes. Prefetch must set `RELEASE_PYTHON_VERSION=3.12` so environment markers match the image. Install offline with:
-
-```bash
-uv pip install --no-index --find-links /cachi2/output/deps/pip
-```
-
-Multi-arch wheels from the RHOAI package index avoid compiling from source inside hermetic builds.
-
-### Prefer typed ecosystems over generic prefetch
-
-The design rule that unlocked Conforma-friendly SBOMs:
-
-> Prefer `rpm` / `pip` / `npm` / `gomod` (or vendored source) over `type: generic` URL downloads.
-
-| Tempting generic download | What we do instead |
-|---|---|
-| ripgrep GitHub release | RHOAI `ripgrep` **pip** wheel + patched `@vscode/ripgrep` postinstall |
-| pandoc static tarball | `pandoc-rhai` **pip** wheel (packaged with AIPCC) |
-| `oc` mirror tarball | `openshift-clients` **RPM** |
-| GitHub / codeload npm refs | Registry-only pins + patched lockfiles |
-| mongocli binary fetch | Submodule + `type: gomod` |
-| Marketplace `.vsix` at build | Repo `utils/*.vsix` via Git LFS |
-
-Generic prefetch remains only where it belongs — mainly CentOS and EPEL **GPG keys** so prefetched RPMs can be verified — not as a dumping ground for binaries.
+Most Jupyter and runtime images share a repo-root prefetch tree. Codeserver keeps its own, because its dependency set (especially npm) is a different beast.
 
 ---
 
-## Step 2: Prefetch, then build offline
+## The design rule that paid off
 
-**Konflux** PipelineRuns declare typed inputs, for example:
+Early on we were tempted to “just download the binary” for awkward tools: ripgrep releases, pandoc tarballs, `oc` mirrors, VS Code marketplace extensions. That works until Conforma asks what those blobs actually *are*.
 
-```yaml
-- name: hermetic
-  value: "true"
-- name: prefetch-input
-  value:
-  - path: prefetch-input/odh   # use rhds downstream
-    type: rpm
-  - path: prefetch-input/odh
-    type: generic
-  - path: jupyter/minimal/ubi9-python-3.12
-    type: pip
-    binary:
-      arch: x86_64,aarch64,ppc64le,s390x
-    requirements_files: [requirements.cpu.txt]
-```
+At Red Hat, the bar is higher than “it builds offline.” Product images must **build from source** or consume **approved dependencies**, such as Python wheels published through AIPCC. A GitHub release tarball prefetched as `type: generic` may satisfy hermetic networking, but it does not satisfy that packaging expectation.
 
-**Local and GitHub Actions** run `prefetch-all.sh` (generic → pip → npm → rpm → gomod), then the Makefile mounts `cachi2/output`. Codeserver builds on GHA also pass `GHA_BUILD=true` (lower VS Code parallelism) and `--layers=false` to fit runner disk and RAM.
+The rule we settled on:
 
-Validation is structural: Konflux runs the build with network isolation; locally you install only from `/cachi2/output/deps/{rpm,npm,pip,...}` via `dnf`, `npm ci --offline`, and `uv --no-index`.
+> Prefer typed ecosystems (`rpm`, `pip`, `npm`, `gomod`, or vendored source) over generic URL downloads. Avoid generic prefetch as much as possible.
+
+Whenever we could turn a loose tarball into a first-class package (or an RPM from a known repo), SBOMs got clearer and release checks got quieter. Generic prefetch stayed mainly for things like GPG keys needed to verify prefetched RPMs, not as a dumping ground for binaries. If you truly cannot package a dependency that way, work with ProdSec on an exception. Treat exceptions as temporary bridges, not the default path.
+
+How we generate RPM and Python lockfiles, and how to run prefetch yourself, lives in the [lockfile generators README](https://github.com/opendatahub-io/notebooks/blob/main/scripts/lockfile-generators/README.md).
 
 ---
 
-## Hard cases: codeserver, ripgrep, and pandoc
+## The hard cases: codeserver, ripgrep, and pandoc
 
-**Codeserver** is the extreme case: [coder/code-server](https://github.com/coder/code-server) as a pinned submodule, dozens of npm lockfile paths in Tekton, URL rewriting to `file:///cachi2/...`, then `npm ci --offline`. Full walkthrough: [codeserver README](https://github.com/opendatahub-io/notebooks/blob/development/codeserver/ubi9-python-3.12/README.md).
+**Codeserver** was the extreme end of the spectrum: a pinned [code-server](https://github.com/coder/code-server) submodule, a large npm graph, URL rewriting into the local cache, then `npm ci --offline`. If you only read one deep dive, make it the [codeserver README](https://github.com/opendatahub-io/notebooks/blob/main/codeserver/ubi9-python-3.12/README.md).
 
-Upstream `@vscode/ripgrep` downloads a binary in `postinstall.js` — incompatible with hermetic builds. Working with AIPCC, we:
+**Ripgrep** was a classic Node trap. Upstream `@vscode/ripgrep` downloads a binary in `postinstall`: fine on the open internet, fatal in a hermetic build. Working with AIPCC, we published a multi-arch `ripgrep` wheel, prefetched it as pip, pointed the environment at the installed binary, and patched the cached postinstall to copy that binary instead of downloading. The same idea generalizes to a lot of “downloads at install time” Node packages.
 
-1. Depend on the RHOAI-published `ripgrep` wheel in `pyproject.toml`.
-2. Prefetch it as **pip**.
-3. Install offline and set `RIPGREP_BINARY_PATH`.
-4. Patch the cached `@vscode/ripgrep` postinstall to copy that binary instead of downloading.
+**Pandoc** followed the same path: swap a static tarball for a `pandoc-rhai` pip wheel so the SBOM sees a real Python package. For FIPS / payload-check context, see [fips.md](https://github.com/opendatahub-io/notebooks/blob/main/docs/fips.md).
 
-**Pandoc** followed the same pattern: replace a generic static tarball with the `pandoc-rhai` pip wheel so Cachi2 and SBOMs treat it as a first-class Python package. See [fips.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/fips.md) for the FIPS / `check-payload` context.
+Partner early on awkward binaries. Having multi-arch wheels *before* you need them in CI saves weeks of “works on my laptop, fails hermetically.”
 
 ---
 
-## Passing Conforma on the product path
+## Passing Conforma without treating exceptions as the plan
 
-For OpenShift AI images, Conforma checks include hermetic and trusted tasks, RPM signatures, multi-arch RPM version consistency, SBOM attributes, and required labels.
+On the OpenShift AI path, Conforma looks for hermetic trusted tasks, RPM signatures, multi-arch consistency, SBOM shape, and required labels. Policy lives in places like [rhtap-ec-policy](https://github.com/release-engineering/rhtap-ec-policy) and [conforma/policy](https://github.com/conforma/policy/tree/main/policy/release).
 
-- Policy data: [rhtap-ec-policy](https://github.com/release-engineering/rhtap-ec-policy)
-- Checks: [conforma/policy/release](https://github.com/conforma/policy/tree/main/policy/release)
-- Product exceptions: release-engineering `konflux-release-data` Enterprise Contract policy for `registry-rhoai-{stage,prod}`
-
-Exceptions are a temporary bridge — not a substitute for fixing packaging shape. Typed ecosystems beat generic tarballs every time. Local validation is documented in [docs/conforma.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/conforma.md).
+Exceptions (including ones coordinated with ProdSec) can bridge a gap. They should not replace fixing packaging shape: build from source or use approved dependencies, and keep generic prefetch rare. Typed ecosystems beat generic tarballs every time. How we validate locally is in [docs/conforma.md](https://github.com/opendatahub-io/notebooks/blob/main/docs/conforma.md).
 
 ---
 
-## Lessons learned
+## What we would tell another team
 
-1. Hermetic is a **packaging discipline**, not a single CI flag: pin, prefetch, install offline.
+1. Treat hermetic as a **packaging practice**, not a single pipeline flag.
 2. Split upstream and subscribed lockfiles when bases differ; never mix CentOS RPMs onto RHEL / AIPCC bases.
-3. Avoid generic prefetch for binaries — push work into rpm / pip / npm / gomod (or vendor source).
-4. Partner early for awkward binaries (ripgrep, pandoc) so multi-arch wheels exist before you need them in CI.
-5. Patch upstream installers that download at postinstall time; the codeserver ripgrep pattern generalizes to many Node ecosystems.
+3. Build from source or use approved dependencies (for example AIPCC Python wheels). Avoid generic prefetch as much as possible; work with ProdSec if you need an exception.
+4. Partner early for awkward binaries so multi-arch approved wheels exist before CI needs them.
+5. Patch upstream installers that download at postinstall time. The codeserver ripgrep pattern travels well.
 6. Automate lock renewal so “hermetic” does not mean “frozen forever.”
-7. Budget CPU and memory for npm-heavy images; document GHA versus Konflux differences.
+7. Budget CPU and memory for npm-heavy images; document where GitHub Actions and Konflux diverge.
 
 ---
 
-## Call to action
+## Where to go next
 
-If you build Konflux or OpenShift AI images and are wrestling with air-gapped or Conforma requirements, start here:
-
-| Goal | Link |
+| If you want to… | Start here |
 |---|---|
-| Architecture | [docs/hermetic-guide.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/hermetic-guide.md) |
-| Run prefetch locally | [scripts/lockfile-generators/README.md](https://github.com/opendatahub-io/notebooks/blob/development/scripts/lockfile-generators/README.md) |
-| Simple PipelineRun | [odh-pipeline-runtime-minimal…](https://github.com/opendatahub-io/notebooks/blob/development/.tekton/odh-pipeline-runtime-minimal-cpu-py312-ubi9-pull-request.yaml) |
-| Complex (npm) case | codeserver `.tekton/odh-workbench-codeserver-*-pull-request.yaml` |
-| Subscription / AIPCC bases | [docs/subscribed-builds.md](https://github.com/opendatahub-io/notebooks/blob/development/docs/subscribed-builds.md) |
+| Understand the architecture | [hermetic-guide.md](https://github.com/opendatahub-io/notebooks/blob/main/docs/hermetic-guide.md) |
+| Generate lockfiles / run prefetch | [lockfile-generators README](https://github.com/opendatahub-io/notebooks/blob/main/scripts/lockfile-generators/README.md) |
+| Copy a simple PipelineRun | [runtime-minimal PR pipeline](https://github.com/opendatahub-io/notebooks/blob/main/.tekton/odh-pipeline-runtime-minimal-cpu-py312-ubi9-pull-request.yaml) |
+| Study the complex npm case | [codeserver README](https://github.com/opendatahub-io/notebooks/blob/main/codeserver/ubi9-python-3.12/README.md) and [codeserver PR pipeline](https://github.com/opendatahub-io/notebooks/blob/main/.tekton/odh-workbench-codeserver-datascience-cpu-py312-ubi9-pull-request.yaml) |
+| Work with subscribed / AIPCC bases | [subscribed-builds.md](https://github.com/opendatahub-io/notebooks/blob/main/docs/subscribed-builds.md) |
+| Validate Conforma locally | [conforma.md](https://github.com/opendatahub-io/notebooks/blob/main/docs/conforma.md) |
 
-Questions and improvements are welcome via issues and PRs on [opendatahub-io/notebooks](https://github.com/opendatahub-io/notebooks). The scripts and docs above are meant to be reused beyond our workbench set.
+Questions and improvements are welcome via issues and PRs on [opendatahub-io/notebooks](https://github.com/opendatahub-io/notebooks). The scripts and docs above are meant to be reused beyond our workbench set. If you are wrestling with air-gapped or Conforma requirements on Konflux or OpenShift AI images, we hope this gives you a head start.
