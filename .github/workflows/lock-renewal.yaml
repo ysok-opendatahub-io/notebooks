@@ -177,7 +177,7 @@ jobs:
         run: echo "CACHE=${CACHE,,}" >> "${GITHUB_ENV}"
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -362,7 +362,7 @@ jobs:
 
       - name: Login to GitHub Container Registry for validation
         if: ${{ github.repository != 'opendatahub-io/notebooks' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -393,7 +393,7 @@ jobs:
             2>/dev/null || true
 
           gh pr create \
-            --title "GHA: Renew lock files" \
+            --title "GHA: Full Lock Files Renewal" \
             --head "${RENEWAL_BRANCH}" \
             --body "$(cat <<'EOF'
           Automated lock file renewal in a single PR with separate commits:
